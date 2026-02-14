@@ -11,7 +11,7 @@ from sksurv.util import Surv
 # PATHS
 # ============================================================
 BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "Models"
+MODELS_DIR = BASE_DIR / "models"
 SPLITS_DIR = MODELS_DIR / "CoxPH_Final" / "splits"
 CLINICOGENOMIC_DIR = MODELS_DIR / "Clinicogenomic_31genes_v2"
 TCGA_PATH = CLINICOGENOMIC_DIR / "tables" / "tcga_clinicogenomic_31genes_with_surv.csv"
