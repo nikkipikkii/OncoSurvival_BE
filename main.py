@@ -20,32 +20,21 @@ from gene import get_gene_intelligence
 app = FastAPI(title="OncoRisk Dual-Model API")
 
 # --- CORS SECURITY CONFIGURATION ---
-# In development, this allows localhost. In production (Render), it expects FRONTEND_URL.
-# Default to localhost if variable is missing (safe for dev, override in Render).
-# frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-
-# origins = [
-#     frontend_url,
-#     "https://onco-survival-ml-front-end.vercel.app/clinical-implementation",
-#     "https://onco-survival-ml-front-end.vercel.app/riskprofile",
-#     "http://localhost:5173",  # Vite Local
-#     "http://localhost:3000",  # React Local
-# ]
-# main.py
-frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/') # Remove trailing slash safety
+# Stripping trailing slash from environment variable to ensure exact match
+frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/')
 
 origins = [
     frontend_url,
-    "https://onco-survival-ml-front-end.vercel.app", # Base domain only
-    "http://localhost:5173",
-    "http://localhost:3000",
+    "https://onco-survival-ml-front-end.vercel.app", # Base domain only for CORS safety
+    "http://localhost:5173",  # Vite Local
+    "http://localhost:3000",  # React Local
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # RESTRICTS access to these domains only
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],    # Allows all methods (POST, GET, etc.)
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -65,6 +54,8 @@ class InferenceRequest(BaseModel):
     nodeStatus: str  # "Positive" or "Negative"
     genes: Dict[str, float]
 
+# --- ENDPOINTS ---
+
 @app.get("/")
 def health_check():
     return {"status": "running", "allowed_origin": frontend_url}
@@ -72,24 +63,26 @@ def health_check():
 @app.get("/metadata")
 async def get_metadata():
     """Syncs the Frontend dropdowns with actual TCGA test patient IDs and genes."""
-    df_tcga = art["df_tcga"]
-    # Convert index to list and take first 50 for demo dropdown to keep payload light
-    test_ids = art["df_test"].index.tolist()[:100] 
-    
-    patients = []
-    for pid in test_ids:
-        # Safety check if ID exists
-        if pid in df_tcga.index:
-            patients.append({
-                "id": pid,
-                "age": float(df_tcga.loc[pid, "AGE"]),
-                "node": 1 if df_tcga.loc[pid, "NODE_POS"] == 1 else 0
-            })
-    
-    return {
-        "genes": gene_features,
-        "patients": patients
-    }
+    try:
+        df_tcga = art["df_tcga"]
+        # Take first 100 for demo dropdown to keep payload light
+        test_ids = art["df_test"].index.tolist()[:100] 
+        
+        patients = []
+        for pid in test_ids:
+            if pid in df_tcga.index:
+                patients.append({
+                    "id": pid,
+                    "age": float(df_tcga.loc[pid, "AGE"]),
+                    "node": 1 if df_tcga.loc[pid, "NODE_POS"] == 1 else 0
+                })
+        
+        return {
+            "genes": gene_features,
+            "patients": patients
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/predict")
 async def predict(data: InferenceRequest):
@@ -104,7 +97,7 @@ async def predict(data: InferenceRequest):
         # Create DataFrame and ensure column order matches training
         row_raw = pd.DataFrame([row_dict])
         
-        # Check for missing columns and fill with 0 if necessary (safety)
+        # Check for missing columns and fill with 0 if necessary
         for feature in features:
             if feature not in row_raw.columns:
                 row_raw[feature] = 0.0
@@ -132,17 +125,12 @@ async def predict(data: InferenceRequest):
         consensus_median = np.nanmean([median_cox, median_rsf])
         agree = agreement_score(median_cox, median_rsf)
         
-        # 5. External Validation (Metabric) Check
-        # Predicting on the whole MB cohort for context (optimized)
-        # In a real high-load API, you might pre-calculate this
+        # 5. Risk Percentile
         risk_mb_cox = cph.predict_partial_hazard(art["df_mb_s"]).values.flatten()
-        
-        # Calculate percentiles
         user_risk_score = hazard_cox
         percentile = (risk_mb_cox < user_risk_score).mean() * 100
 
-        # 6. Graphs Data (Simplified for JSON response)
-        # Downsample for frontend performance
+        # 6. Graphs Data (Downsampled for frontend)
         indices = np.linspace(0, len(times_cox) - 1, 50, dtype=int)
         
         graph_data = {
@@ -160,26 +148,21 @@ async def predict(data: InferenceRequest):
             "risk_percentile": float(percentile),
             "graph_data": graph_data
         }
-# --- ADD THIS TO THE BOTTOM OF main.py ---
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/hero-graphs")
 async def get_landing_graphs():
-    """
-    This is the missing link. It takes the pre-loaded artifacts 
-    and generates the data for the Hero section.
-    """
+    """Returns data for the Interactive Landing Hub graphs."""
     try:
-        # We import here to ensure the logic is only called when needed
         from graph import get_hero_graphs
-        
-        # 'art' is the global variable already defined at the top of your main.py
+        # 'art' is the global variable defined at the top
         data = get_hero_graphs(art) 
         return data
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    # except Exception as e:
-    #     import traceback
-    #     traceback.print_exc()
-    #     raise HTTPException(status_code=500, detail=str(e))
