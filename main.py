@@ -160,8 +160,26 @@ async def predict(data: InferenceRequest):
             "risk_percentile": float(percentile),
             "graph_data": graph_data
         }
+# --- ADD THIS TO THE BOTTOM OF main.py ---
 
+@app.get("/hero-graphs")
+async def get_landing_graphs():
+    """
+    This is the missing link. It takes the pre-loaded artifacts 
+    and generates the data for the Hero section.
+    """
+    try:
+        # We import here to ensure the logic is only called when needed
+        from graph import get_hero_graphs
+        
+        # 'art' is the global variable already defined at the top of your main.py
+        data = get_hero_graphs(art) 
+        return data
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    # except Exception as e:
+    #     import traceback
+    #     traceback.print_exc()
+    #     raise HTTPException(status_code=500, detail=str(e))
