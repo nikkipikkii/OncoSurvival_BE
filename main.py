@@ -26,6 +26,8 @@ frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 origins = [
     frontend_url,
+    "https://onco-survival-ml-front-end.vercel.app/clinical-implementation",
+    "https://onco-survival-ml-front-end.vercel.app/riskprofile",
     "http://localhost:5173",  # Vite Local
     "http://localhost:3000",  # React Local
 ]
