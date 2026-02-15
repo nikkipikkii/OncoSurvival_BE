@@ -33,8 +33,7 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    # allow_origins=origins,
-    allow_origins=["*"],
+    allow_origins=["*"], # Keep wildcard for debugging, restrict in production if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -166,23 +165,31 @@ async def predict(data: InferenceRequest):
         # 5. Graphs
         indices = np.linspace(0, len(times_cox) - 1, 50, dtype=int)
         rsf_interp = np.interp(times_cox[indices], times_rsf, surv_rsf)
-
-        # --- DEBUG LOGGING STARTS HERE ---
+        
         print("\n--- DEBUGGING CALCULATED VALUES ---")
+
         print(f"Cox Median (Raw): {median_cox}")
+
         print(f"RSF Median (Raw): {median_rsf}")
+
         print(f"Consensus (Raw): {consensus_median}")
+
         print(f"Agreement (Raw): {agree}")
+
         print(f"Percentile (Raw): {percentile}")
+
         
+
         # Check for NaNs in arrays
+
         if np.isnan(surv_cox[indices]).any():
+
             print("WARNING: NaN found in Cox Graph Data")
+
         if np.isnan(rsf_interp).any():
+
             print("WARNING: NaN found in RSF Graph Data")
-        
         # --- SAFE RETURN WITH CLEANING ---
-        # This converts any 'nan' to None (null) so JSON doesn't crash
         response = {
             "cox_median": clean_float(median_cox),
             "rsf_median": clean_float(median_rsf),
@@ -205,12 +212,34 @@ async def predict(data: InferenceRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
+# =================================================================
+# NEW ENDPOINT: GENE INTELLIGENCE
+# =================================================================
+@app.get("/gene-intelligence")
+async def get_gene_data():
+    try:
+        # Check if art exists
+        if art is None:
+             raise HTTPException(status_code=500, detail="Model artifacts not loaded")
+        
+        data = get_gene_intelligence(art)
+        # CRITICAL FIX: Clean NaNs before sending JSON
+        return clean_nan_values(data)
+    except Exception as e:
+        print(f"GENE INTELLIGENCE ERROR: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =================================================================
+# FIXED ENDPOINT: HERO GRAPHS (Added clean_nan_values)
+# =================================================================
 @app.get("/hero-graphs")
 async def get_landing_graphs():
     try:
         from graph import get_hero_graphs
         data = get_hero_graphs(art)
-        return data
+        # CRITICAL FIX: Clean NaNs to prevent 500 Internal Server Error
+        return clean_nan_values(data)
     except Exception as e:
         print(f"HERO GRAPH ERROR: {e}")
         traceback.print_exc()
