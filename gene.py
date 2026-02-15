@@ -1,9 +1,7 @@
 import pandas as pd
 import numpy as np
+import math
 
-# Biological narratives serve as the static knowledge base.
-# While the text is static, the association (which gene gets which rank) 
-# is determined dynamically by the model below.
 GENE_NARRATIVES = {
     "KLRB1": "Encodes CD161, a marker of killer cell lectin-like receptors. High expression is often associated with favorable prognosis in breast cancer due to tumor-infiltrating lymphocytes (TILs) and immune cytotoxicity.",
     "CCL19": "A chemokine that organizes immune responses. High expression correlates with the presence of tertiary lymphoid structures (TLS), generally indicating a robust anti-tumor immune microenvironment.",
@@ -19,42 +17,51 @@ GENE_NARRATIVES = {
     "TFPI2": "Tissue factor pathway inhibitor 2. It regulates matrix remodeling and invasion. Silencing via methylation is common in aggressive cancers."
 }
 
+def safe_round(val, decimals=4):
+    """Safely rounds a value, returning 0.0 if NaN/Inf."""
+    try:
+        val = float(val)
+        if math.isnan(val) or math.isinf(val):
+            return 0.0
+        return round(val, decimals)
+    except:
+        return 0.0
+
 def get_gene_intelligence(art):
     """
     Extracts dynamic gene rankings and coefficients from the model artifacts.
     Merges them with biological narratives for the frontend.
     """
-    # 1. Retrieve the Importance Dataframe from Artifacts
     if "df_imp_cox" not in art:
         return []
 
     df_imp = art["df_imp_cox"]
 
-    # 2. Filter for Genes only (excluding clinical features like Age/Stage)
-    #    and Sort by Absolute Coefficient Magnitude (Model Contribution)
+    # Filter for Genes
     df_genes = df_imp[df_imp["type"] == "gene"].copy()
+    
+    # Ensure abs_coef is calculated
+    if "abs_coef" not in df_genes.columns:
+        df_genes["abs_coef"] = df_genes["coef"].abs()
+        
     df_genes = df_genes.sort_values("abs_coef", ascending=False)
 
     gene_data = []
 
-    # 3. Iterate dynamically through the top genes
-    #    'rank' is generated based on the sort order from the model
     for rank, (idx, row) in enumerate(df_genes.iterrows(), 1):
         gene_name = row["feature"]
         
-        # Get narrative if available, else generate a generic data-driven narrative
         narrative = GENE_NARRATIVES.get(gene_name, (
             f"This gene ({gene_name}) was identified by the Cox model as a significant predictor. "
-            f"It holds a rank of #{rank} based on its absolute hazard contribution, indicating it "
-            "plays a non-trivial role in the model's risk stratification logic."
+            f"It holds a rank of #{rank} based on its absolute hazard contribution."
         ))
 
         gene_data.append({
             "rank": rank,
             "gene": gene_name,
-            # Rounding for clean UI display
-            "coef": round(float(row["coef"]), 4),
-            "abs": round(float(row["abs_coef"]), 4),
+            # Use safe_round to ensure JSON compatibility
+            "coef": safe_round(row["coef"], 4),
+            "abs": safe_round(row["abs_coef"], 4),
             "narrative": narrative
         })
 
