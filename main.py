@@ -53,6 +53,12 @@ class InferenceRequest(BaseModel):
     age: float
     nodeStatus: str  # "Positive" or "Negative"
     genes: Dict[str, float]
+# --- HELPER ---
+def clean_float(value):
+    """Converts NaN or Inf to None so JSON doesn't crash."""
+    if value is None or np.isnan(value) or np.isinf(value):
+        return None
+    return float(value)
 
 # --- ENDPOINTS ---
 
