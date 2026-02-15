@@ -75,6 +75,23 @@ def clean_float(value):
     except Exception:
         return None
 
+def clean_nan_values(obj):
+    """
+    Recursively cleans a complex object (dict/list) to replace NaNs with None.
+    Critical for the /hero-graphs endpoint.
+    """
+    if isinstance(obj, float):
+        return clean_float(obj)
+    elif isinstance(obj, dict):
+        return {k: clean_nan_values(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_nan_values(v) for v in obj]
+    elif isinstance(obj, (np.float64, np.float32)):
+        return clean_float(obj)
+    elif isinstance(obj, (np.int64, np.int32)):
+        return int(obj)
+    return obj
+
 # --- ENDPOINTS ---
 
 @app.get("/")
