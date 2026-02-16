@@ -204,18 +204,24 @@ async def predict(data: InferenceRequest):
         response = {
             "summary": {
                 "coxHazard": clean_float(hazard_cox),
-                "rsfRisk": clean_float(1.0 - float(surv_rsf_grid[-1])), # Risk = 1 - Survival
+                   "rsfRisk": round(float(sf_rsf.y[-1]), 2),
+                # "rsfRisk": clean_float(1.0 - float(surv_rsf_grid[-1])), # Risk = 1 - Survival
                 "agreement": clean_float(agree),
                 "agreementLabel": agreement_label(agree)
             },
             "estimates": {
-                "medianCox": clean_float(m_cox),
-                "medianRsf": clean_float(m_rsf),
-                "consensus": clean_float(consensus_median)
+                # "medianCox": clean_float(m_cox),
+                # "medianRsf": clean_float(m_rsf),
+                # "consensus": clean_float(consensus_median)
+                "medianCox": clean_float(m_cox, 1),
+                "medianRsf": clean_float(m_rsf, 1),
+                "consensus": clean_float(consensus_median, 1)
             },
             "rmst": {
-                "cox": clean_float(r_cox),
-                "rsf": clean_float(r_rsf)
+                # "cox": clean_float(r_cox),
+                # "rsf": clean_float(r_rsf)
+                "cox": clean_float(r_cox, 1),
+                "rsf": clean_float(r_rsf, 1)
             },
             # Graph Data formatted specifically for Recharts
             "curveData": [
