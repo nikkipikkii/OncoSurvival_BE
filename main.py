@@ -1,275 +1,445 @@
 import os
+import sys
 import math
+import traceback
 import numpy as np
 import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+# --- Machine Learning Imports ---
+from sklearn.preprocessing import StandardScaler
+from lifelines import CoxPHFitter, KaplanMeierFitter
+from lifelines.utils import concordance_index
+from sksurv.ensemble import RandomSurvivalForest
+from sksurv.util import Surv
+from sksurv.metrics import concordance_index_censored
+
+# --- API Imports ---
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, List, Optional
-import traceback
 
-# --- IMPORT LOGIC FROM YOUR MODULES ---
+# --- Local Imports (for graphs) ---
 from graph import get_hero_graphs
-from gene import get_gene_intelligence
-from model_logic import (
-    get_artifacts,
-    median_survival_time,
-    rmst,
-    agreement_score,
-    agreement_label
-)
+
+# ============================================================
+# 1. BIOLOGICAL KNOWLEDGE BASE (From app.py)
+# ============================================================
+GENE_NARRATIVES = {
+    "CD24": "Immune evasion via Siglec-10; higher expression aligns with increased hazard.",
+    "SLC16A2": "Thyroid hormone transport; metabolic rewiring under stress.",
+    "SERPINA1": "Protease regulation and invasion-permissive microenvironment.",
+    "TFPI2": "Extracellular matrix control and metastatic potential.",
+    "SEMA3B": "Loss of repulsive anti-invasive cues.",
+    "TNFRSF14": "Tumor–immune interface regulation.",
+    "APOOL": "Mitochondrial lipid handling.",
+    "MRPL13": "Oxidative phosphorylation dependency.",
+    "QPRT": "NAD+ biosynthesis under stress.",
+    "JCHAIN": "Humoral immune architecture.",
+    "NANOS1": "Stem-like, therapy-tolerant state.",
+    "EDA2R": "Stress-adaptive signaling.",
+}
+
+# ============================================================
+# 2. CORE LOGIC & TRAINING (Exact logic from app.py)
+# ============================================================
+
+def median_survival_time(times, surv):
+    below = surv <= 0.5
+    if not np.any(below):
+        return np.nan
+    return float(times[np.argmax(below)])
+
+def rmst(times, surv):
+    return float(np.trapz(surv, times))
+
+def agreement_score(median_cox, median_rsf):
+    if np.isnan(median_cox) or np.isnan(median_rsf):
+        return np.nan
+    denom = max(median_cox, median_rsf)
+    if denom == 0:
+        return np.nan
+    delta = abs(median_cox - median_rsf) / denom
+    return float(max(0.0, min(1.0, 1.0 - delta)))
+
+def agreement_label(score):
+    if np.isnan(score): return "Unknown"
+    if score >= 0.75: return "High"
+    if score >= 0.5: return "Moderate"
+    return "Low"
+
+def get_artifacts():
+    print("System: Loading artifacts and training models (app.py logic)...")
+    
+    # --- Paths ---
+    BASE_DIR = Path(__file__).resolve().parent
+    MODELS_DIR = BASE_DIR / "models" # Note: check if folder is "Models" or "models" on disk
+    CLINICOGENOMIC_DIR = MODELS_DIR / "Clinicogenomic_31genes_v2"
+    TCGA_PATH = CLINICOGENOMIC_DIR / "tables" / "tcga_clinicogenomic_31genes_with_surv.csv"
+    MB_PATH = CLINICOGENOMIC_DIR / "tables" / "metabric_clinicogenomic_31genes_with_surv.csv"
+    SPLITS_DIR = MODELS_DIR / "CoxPH_Final" / "splits"
+
+    if not TCGA_PATH.exists():
+        # Fallback for case sensitivity or folder structure differences
+        MODELS_DIR = BASE_DIR / "Models"
+        SPLITS_DIR = MODELS_DIR / "CoxPH_Final" / "splits"
+        CLINICOGENOMIC_DIR = MODELS_DIR / "Clinicogenomic_31genes_v2"
+        TCGA_PATH = CLINICOGENOMIC_DIR / "tables" / "tcga_clinicogenomic_31genes_with_surv.csv"
+        MB_PATH = CLINICOGENOMIC_DIR / "tables" / "metabric_clinicogenomic_31genes_with_surv.csv"
+
+    if not TCGA_PATH.exists():
+        raise FileNotFoundError(f"Data files missing. Checked: {TCGA_PATH}")
+
+    # --- Load Data ---
+    df_tcga = pd.read_csv(TCGA_PATH, index_col=0)
+    df_mb = pd.read_csv(MB_PATH, index_col=0)
+
+    clinical = ["AGE", "NODE_POS"]
+    gene_features = [c for c in df_tcga.columns if c not in ["time", "event", "AGE", "NODE_POS"]]
+    features = clinical + gene_features
+
+    # --- Splits ---
+    try:
+        train_ids = pd.read_csv(SPLITS_DIR / "train_ids.csv").iloc[:, 0]
+        test_ids = pd.read_csv(SPLITS_DIR / "test_ids.csv").iloc[:, 0]
+        train_ids = train_ids[train_ids.isin(df_tcga.index)]
+        test_ids = test_ids[test_ids.isin(df_tcga.index)]
+        df_train = df_tcga.loc[train_ids]
+        df_test = df_tcga.loc[test_ids]
+    except Exception as e:
+        print(f"Warning: Split loading failed ({e}). Using full dataset.")
+        df_train = df_tcga
+        df_test = df_tcga.sample(min(10, len(df_tcga)))
+
+    # --- Scaling (Fit on Train ONLY - Crucial for app.py logic) ---
+    scaler = StandardScaler().fit(df_train[features])
+    X_train = scaler.transform(df_train[features])
+    X_test = scaler.transform(df_test[features])
+    X_mb = scaler.transform(df_mb[features])
+
+    # --- DataFrames for Cox ---
+    df_train_s = pd.concat([df_train[["time", "event"]], pd.DataFrame(X_train, index=df_train.index, columns=features)], axis=1)
+    df_test_s = pd.concat([df_test[["time", "event"]], pd.DataFrame(X_test, index=df_test.index, columns=features)], axis=1)
+    df_mb_s = pd.concat([df_mb[["time", "event"]], pd.DataFrame(X_mb, index=df_mb.index, columns=features)], axis=1)
+
+    # --- Train CoxPH ---
+    print("System: Training CoxPHFitter...")
+    cph = CoxPHFitter()
+    cph.fit(df_train_s, "time", "event")
+
+    # --- Train RSF (EXACT app.py parameters) ---
+    print("System: Training RSF (n_estimators=500)...")
+    y_train = Surv.from_arrays(event=df_train["event"].astype(bool), time=df_train["time"])
+    rsf = RandomSurvivalForest(
+        n_estimators=500,
+        min_samples_leaf=15,
+        max_features="sqrt",
+        random_state=123,
+        n_jobs=-1
+    )
+    rsf.fit(X_train, y_train)
+
+    # --- Pre-calculate Metrics & Risks ---
+    risk_test_cox = cph.predict_partial_hazard(df_test_s).values.flatten()
+    risk_mb_cox = cph.predict_partial_hazard(df_mb_s).values.flatten()
+
+    ch_test = rsf.predict_cumulative_hazard_function(X_test)
+    risk_test_rsf = np.array([fn.y[-1] for fn in ch_test])
+
+    # --- Feature Intelligence Logic (From app.py) ---
+    # Cox Importance
+    df_imp_cox = cph.params_.to_frame("coef")
+    df_imp_cox["feature"] = df_imp_cox.index
+    df_imp_cox["abs_coef"] = df_imp_cox["coef"].abs()
+    df_imp_cox["type"] = ["clinical" if f in clinical else "gene" for f in df_imp_cox.index]
+    df_imp_cox = df_imp_cox.sort_values("abs_coef", ascending=False)
+
+    # RSF Importance
+    try:
+        df_imp_rsf = pd.DataFrame({
+            "feature": features,
+            "importance": rsf.feature_importances_,
+        })
+        df_imp_rsf["abs_importance"] = df_imp_rsf["importance"].abs()
+        df_imp_rsf["type"] = ["clinical" if f in clinical else "gene" for f in features]
+        df_imp_rsf = df_imp_rsf.sort_values("abs_importance", ascending=False)
+    except Exception:
+        df_imp_rsf = pd.DataFrame()
+
+    # --- C-Indices (Model Facts) ---
+    cindex_test_cox = concordance_index(df_test_s["time"], -risk_test_cox, df_test_s["event"])
+    cindex_mb_cox = concordance_index(df_mb_s["time"], -risk_mb_cox, df_mb_s["event"])
+    
+    # Calculate RSF C-Index (requires censored metric)
+    cindex_test_rsf = concordance_index_censored(
+        df_test["event"].astype(bool), df_test["time"].astype(float), risk_test_rsf
+    )[0]
+    
+    # Predict RSF risk for MB for C-index calculation
+    ch_mb = rsf.predict_cumulative_hazard_function(X_mb)
+    risk_mb_rsf = np.array([fn.y[-1] for fn in ch_mb])
+    cindex_mb_rsf = concordance_index_censored(
+        df_mb["event"].astype(bool), df_mb["time"].astype(float), risk_mb_rsf
+    )[0]
+
+    return {
+        "scaler": scaler,
+        "cph": cph,
+        "rsf": rsf,
+        "features": features,
+        "gene_features": gene_features,
+        "clinical": clinical,
+        "df_tcga": df_tcga,
+        "df_test": df_test_s,
+        "df_mb_s": df_mb_s,
+        
+        # Risk Artifacts
+        "risk_mb_cox": risk_mb_cox,
+        "risk_test_cox": risk_test_cox,
+        "risk_test_rsf": risk_test_rsf,
+        
+        # Feature Intelligence Artifacts
+        "df_imp_cox": df_imp_cox,
+        "df_imp_rsf": df_imp_rsf,
+        
+        # Model Facts / Metrics
+        "cindex_test_cox": cindex_test_cox,
+        "cindex_mb_cox": cindex_mb_cox,
+        "cindex_test_rsf": cindex_test_rsf,
+        "cindex_mb_rsf": cindex_mb_rsf,
+        
+        # Helper for Graphs
+        "df_tcga_test_km": df_test_s.assign(risk_cox=risk_test_cox),
+        "df_mb_km": df_mb_s.assign(risk_cox=risk_mb_cox)
+    }
+
+# ============================================================
+# 3. API CONFIGURATION
+# ============================================================
 
 app = FastAPI(title="OncoRisk Dual-Model API")
 
-# --- CORS SECURITY ---
-# In deployment, this allows the frontend to talk to the backend
-frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/')
-origins = [
-    frontend_url,
-    "https://onco-survival-ml-front-end.vercel.app",
-    "http://localhost:5173",
-    "http://localhost:3000",
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Wildcard is safer for debugging; restrict in strict prod
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- INITIALIZATION ---
-print("Initializing Model Artifacts...")
+# Initialize
+print("Initializing Application...")
 try:
     art = get_artifacts()
     scaler = art["scaler"]
     cph = art["cph"]
     rsf = art["rsf"]
-    features = art["features"]       # The list of feature names in correct order
-    gene_features = art["gene_features"] # The list of just the 31 genes
-    print("Artifacts Loaded Successfully.")
+    features = art["features"]
+    gene_features = art["gene_features"]
+    risk_mb_cox_global = art["risk_mb_cox"]
+    print("Initialization Complete.")
 except Exception as e:
-    print(f"CRITICAL ERROR LOADING ARTIFACTS: {e}")
+    print(f"CRITICAL INITIALIZATION ERROR: {e}")
     traceback.print_exc()
 
-# --- DATA MODELS ---
+# Models
 class InferenceRequest(BaseModel):
     age: float
-    nodeStatus: str 
+    nodeStatus: str
     genes: Dict[str, float]
 
-# --- TYPE-SYNC SAFETY HELPERS (PREVENTS CRASHES) ---
-def clean_float(value):
-    """
-    Checks if a float is valid for JSON (handles NaN/Inf/Numpy types).
-    Returns None if invalid, which JSON accepts as 'null'.
-    """
-    if value is None:
-        return None
+# Helpers
+def clean_float(value, precision=2):
+    if value is None: return None
     try:
-        val = float(value) # Force conversion from np.float to python float
-        if math.isnan(val) or math.isinf(val):
-            return None
-        return val
-    except Exception:
-        return None
+        val = float(value)
+        if math.isnan(val) or math.isinf(val): return None
+        return round(val, precision)
+    except: return None
 
 def clean_nan_values(obj):
-    """
-    Recursively cleans a complex object (dict/list) to replace NaNs with None.
-    Crucial for nested responses like hero-graphs or gene-intelligence.
-    """
-    if isinstance(obj, float):
-        return clean_float(obj)
-    elif isinstance(obj, dict):
-        return {k: clean_nan_values(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [clean_nan_values(v) for v in obj]
-    elif isinstance(obj, (np.float64, np.float32)):
-        return clean_float(obj)
-    elif isinstance(obj, (np.int64, np.int32)):
-        return int(obj)
+    if isinstance(obj, float): return clean_float(obj)
+    elif isinstance(obj, dict): return {k: clean_nan_values(v) for k, v in obj.items()}
+    elif isinstance(obj, list): return [clean_nan_values(v) for v in obj]
+    elif isinstance(obj, (np.float64, np.float32)): return clean_float(obj)
     return obj
 
-# --- ENDPOINTS ---
-
-@app.get("/")
-def health_check():
-    return {"status": "running", "allowed_origin": frontend_url}
+# ============================================================
+# 4. ENDPOINTS
+# ============================================================
 
 @app.get("/metadata")
 async def get_metadata():
-    """
-    Returns patient list and gene list. 
-    Includes 'genes' in patient object so Auto-Fill works in frontend.
-    """
-    try:
-        df_tcga = art["df_tcga"]
-        test_ids = art["df_test"].index.tolist()[:100] 
-        
-        patients = []
-        for pid in test_ids:
-            if pid in df_tcga.index:
-                # Extract actual gene values for this patient to enable auto-fill
-                patient_genes = df_tcga.loc[pid, gene_features].to_dict()
-                
-                patients.append({
-                    "id": pid,
-                    "age": clean_float(df_tcga.loc[pid, "AGE"]),
-                    "node": 1 if df_tcga.loc[pid, "NODE_POS"] == 1 else 0,
-                    "genes": clean_nan_values(patient_genes) 
-                })
-        
-        return {"genes": gene_features, "patients": patients}
-    except Exception as e:
-        print(f"METADATA ERROR: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    df_tcga = art["df_tcga"]
+    test_ids = art["df_test"].index.tolist()[:100]
+    patients = []
+    for pid in test_ids:
+        if pid in df_tcga.index:
+            patient_genes = df_tcga.loc[pid, gene_features].to_dict()
+            patients.append({
+                "id": pid,
+                "age": float(df_tcga.loc[pid, "AGE"]),
+                "node": 1 if df_tcga.loc[pid, "NODE_POS"] == 1 else 0,
+                "genes": {k: clean_float(v, 4) for k,v in patient_genes.items()}
+            })
+    return {"genes": gene_features, "patients": patients}
 
 @app.post("/predict")
 async def predict(data: InferenceRequest):
-    """
-    The Core Inference Logic. 
-    1. Feature Engineering (Age + Node + Genes)
-    2. Scaling (StandardScaler)
-    3. Model Prediction (Cox + RSF)
-    4. Grid Synchronization (200 points)
-    5. Metric Calculation (Median, RMST, Agreement)
-    6. Response Formatting (Strict TypeSync)
-    """
     try:
-        # --- 1. FEATURE PREPARATION ---
+        # 1. Feature Prep (Robust logic from app.py)
         node_pos = 1 if data.nodeStatus == "Positive" else 0
         row_dict = {"AGE": data.age, "NODE_POS": node_pos}
         row_dict.update(data.genes)
         
-        # Create DataFrame ensuring EXACT column order required by Scaler
-        row_raw = pd.DataFrame([row_dict], columns=features)
+        row_raw = pd.DataFrame([row_dict])
+        for feature in features:
+            if feature not in row_raw.columns:
+                row_raw[feature] = 0.0
         
-        # Safeguard: Fill missing columns with 0.0 to prevent crash
-        row_raw = row_raw.fillna(0.0)
-        
-        # Scale
+        row_raw = row_raw[features]
         X_row = scaler.transform(row_raw.values)
         df_row_scaled = pd.DataFrame(X_row, columns=features)
 
-        # --- 2. MODEL INFERENCE ---
-        
-        # Cox Hazard
+        # 2. Inference
         hazard_cox = float(cph.predict_partial_hazard(df_row_scaled).values[0])
         surv_func_cox = cph.predict_survival_function(df_row_scaled)
-        # Extract times and probabilities (Step function)
         times_cox = surv_func_cox.index.values.astype(float)
         surv_cox = surv_func_cox.values[:, 0].astype(float)
 
-        # RSF Risk
         surv_funcs_rsf = rsf.predict_survival_function(X_row)
         sf_rsf = surv_funcs_rsf[0]
-        # Extract times and probabilities (Step function)
         times_rsf = sf_rsf.x.astype(float)
         surv_rsf = sf_rsf.y.astype(float)
 
-        # --- 3. GRID SYNCHRONIZATION (The "Original Logic") ---
-        # We must interpolate both models onto a shared time grid to calculate 
-        # consensus and draw the graph correctly.
+        # 3. Percentile & Grid Sync
+        percentile = (risk_mb_cox_global < hazard_cox).mean() * 100
+        
         t_min = 0.0
         t_max = min(times_cox.max(), times_rsf.max())
-        
-        # Create a common grid of 200 points
-        grid = np.linspace(t_min, t_max, 200) 
+        grid = np.linspace(t_min, t_max, 200)
 
-        # Interpolate
         surv_cox_grid = np.interp(grid, times_cox, surv_cox)
         surv_rsf_grid = np.interp(grid, times_rsf, surv_rsf)
 
-        # --- 4. METRIC EXTRACTION ---
         m_cox = median_survival_time(grid, surv_cox_grid)
         m_rsf = median_survival_time(grid, surv_rsf_grid)
-        
         r_cox = rmst(grid, surv_cox_grid)
         r_rsf = rmst(grid, surv_rsf_grid)
-        
-        # Consensus & Agreement
         consensus_median = np.nanmean([m_cox, m_rsf])
         agree = agreement_score(m_cox, m_rsf)
 
-        # Logging for Debugging
-        print(f"Inference -> Age: {data.age}, Node: {data.nodeStatus}")
-        print(f"Cox Median: {m_cox}, RSF Median: {m_rsf}, Agreement: {agree}")
+        print(f"Inference -> Age: {data.age}, Node: {data.nodeStatus}, Pct: {percentile:.1f}%")
 
-        # --- 5. RESPONSE CONSTRUCTION (STRICT TYPESYNC) ---
-        # We manually build the dict using `clean_float` and `float()` casting 
-        # to ensure no Numpy types leak into the JSON response.
-        
-        response = {
+        return {
             "summary": {
                 "coxHazard": clean_float(hazard_cox),
-                   "rsfRisk": round(float(sf_rsf.y[-1]), 2),
-                # "rsfRisk": clean_float(1.0 - float(surv_rsf_grid[-1])), # Risk = 1 - Survival
+                "rsfRisk": clean_float(float(sf_rsf.y[-1])),
                 "agreement": clean_float(agree),
-                "agreementLabel": agreement_label(agree)
+                "agreementLabel": agreement_label(agree),
+                "riskPercentile": clean_float(percentile, 1)
             },
             "estimates": {
-                # "medianCox": clean_float(m_cox),
-                # "medianRsf": clean_float(m_rsf),
-                # "consensus": clean_float(consensus_median)
                 "medianCox": clean_float(m_cox, 1),
                 "medianRsf": clean_float(m_rsf, 1),
                 "consensus": clean_float(consensus_median, 1)
             },
             "rmst": {
-                # "cox": clean_float(r_cox),
-                # "rsf": clean_float(r_rsf)
                 "cox": clean_float(r_cox, 1),
                 "rsf": clean_float(r_rsf, 1)
             },
-            # Graph Data formatted specifically for Recharts
             "curveData": [
-                {
-                    "time": float(t), 
-                    "cox": float(c), 
-                    "rsf": float(r)
-                } 
+                {"time": clean_float(t, 1), "cox": clean_float(c, 4), "rsf": clean_float(r, 4)} 
                 for t, c, r in zip(grid, surv_cox_grid, surv_rsf_grid)
             ]
         }
-        
-        return response
-
     except Exception as e:
-        print(f"PREDICTION ERROR: {str(e)}")
+        print(f"Error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- NEW: Gene Intelligence Endpoint (Based on app.py logic) ---
 @app.get("/gene-intelligence")
-async def get_gene_data():
+async def gene_intelligence():
     try:
-        if art is None:
-             raise HTTPException(status_code=500, detail="Model artifacts not loaded")
+        df_imp_cox = art["df_imp_cox"]
+        # Filter for genes only
+        df_genes = df_imp_cox[df_imp_cox["type"] == "gene"].copy()
+        # Sort by absolute coefficient (impact)
+        df_genes = df_genes.sort_values("abs_coef", ascending=False)
         
-        data = get_gene_intelligence(art)
-        # SAFEGUARD: Recursively clean NaNs
-        return clean_nan_values(data)
+        # Build response list
+        results = []
+        for rank, (idx, row) in enumerate(df_genes.iterrows(), 1):
+            gene_name = row["feature"]
+            narrative = GENE_NARRATIVES.get(gene_name, "Contributes to risk via expression magnitude.")
+            
+            results.append({
+                "rank": rank,
+                "gene": gene_name,
+                "coefficient": clean_float(row["coef"], 4),
+                "absCoefficient": clean_float(row["abs_coef"], 4),
+                "narrative": narrative
+            })
+            
+        return results
     except Exception as e:
-        print(f"GENE INTELLIGENCE ERROR: {e}")
-        traceback.print_exc()
+        print(f"Gene Intelligence Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/hero-graphs")
-async def get_landing_graphs():
+# --- NEW: Feature Intelligence Endpoint ---
+@app.get("/feature-intelligence")
+async def feature_intelligence():
     try:
-        data = get_hero_graphs(art)
-        # SAFEGUARD: Recursively clean NaNs
-        return clean_nan_values(data)
+        # Get Top 30 Cox Features
+        df_cox = art["df_imp_cox"].head(30)
+        cox_data = [
+            {"feature": r["feature"], "value": clean_float(r["coef"], 4), "absVal": clean_float(r["abs_coef"], 4)}
+            for _, r in df_cox.iterrows()
+        ]
+
+        # Get Top 30 RSF Features
+        rsf_data = []
+        if not art["df_imp_rsf"].empty:
+            df_rsf = art["df_imp_rsf"].head(30)
+            rsf_data = [
+                {"feature": r["feature"], "value": clean_float(r["importance"], 4)}
+                for _, r in df_rsf.iterrows()
+            ]
+
+        return {"cox": cox_data, "rsf": rsf_data}
     except Exception as e:
-        print(f"HERO GRAPH ERROR: {e}")
-        traceback.print_exc()
+        print(f"Feature Intelligence Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- NEW: Model Facts Endpoint ---
+@app.get("/model-facts")
+async def model_facts():
+    return {
+        "metrics": {
+            "cindex_test_cox": clean_float(art["cindex_test_cox"], 3),
+            "cindex_mb_cox": clean_float(art["cindex_mb_cox"], 3),
+            "cindex_test_rsf": clean_float(art["cindex_test_rsf"], 3),
+            "cindex_mb_rsf": clean_float(art["cindex_mb_rsf"], 3)
+        },
+        "info": {
+            "tcga_count": len(art["df_tcga"]),
+            "metabric_count": len(art["df_mb_s"]),
+            "feature_count": len(art["features"])
+        }
+    }
+
+@app.get("/hero-charts")
+async def hero_charts():
+    # Use the local graph.py logic but feed it our calculated artifacts
+    return get_hero_graphs(art)
 
 if __name__ == "__main__":
     import uvicorn
-    # Local development runner
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+
+
 # import os
 # import math
 # import numpy as np
@@ -279,11 +449,10 @@ if __name__ == "__main__":
 # from pydantic import BaseModel
 # from typing import Dict, List, Optional
 # import traceback
+
+# # --- IMPORT LOGIC FROM YOUR MODULES ---
 # from graph import get_hero_graphs
 # from gene import get_gene_intelligence
-
-# # Import pure logic
-# #import from app-> get_arti, median_surviva_rmst,agre_score,agr_label 
 # from model_logic import (
 #     get_artifacts,
 #     median_survival_time,
@@ -291,24 +460,22 @@ if __name__ == "__main__":
 #     agreement_score,
 #     agreement_label
 # )
-# # from graph import get_hero_graphs
-# # from gene import get_gene_intelligence
 
 # app = FastAPI(title="OncoRisk Dual-Model API")
 
 # # --- CORS SECURITY ---
+# # In deployment, this allows the frontend to talk to the backend
 # frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/')
-# # --------------------extra
 # origins = [
 #     frontend_url,
 #     "https://onco-survival-ml-front-end.vercel.app",
 #     "http://localhost:5173",
 #     "http://localhost:3000",
 # ]
-# # --------extra^
+
 # app.add_middleware(
 #     CORSMiddleware,
-#     allow_origins=["*"], # Keep wildcard for debugging, restrict in production if needed
+#     allow_origins=["*"], # Wildcard is safer for debugging; restrict in strict prod
 #     allow_credentials=True,
 #     allow_methods=["*"],
 #     allow_headers=["*"],
@@ -320,10 +487,9 @@ if __name__ == "__main__":
 #     art = get_artifacts()
 #     scaler = art["scaler"]
 #     cph = art["cph"]
-#     print(cph);
 #     rsf = art["rsf"]
-#     features = art["features"]
-#     gene_features = art["gene_features"]
+#     features = art["features"]       # The list of feature names in correct order
+#     gene_features = art["gene_features"] # The list of just the 31 genes
 #     print("Artifacts Loaded Successfully.")
 # except Exception as e:
 #     print(f"CRITICAL ERROR LOADING ARTIFACTS: {e}")
@@ -335,16 +501,16 @@ if __name__ == "__main__":
 #     nodeStatus: str 
 #     genes: Dict[str, float]
 
-# # --- HELPER: THE FIX FOR JSON ERRORS ---
+# # --- TYPE-SYNC SAFETY HELPERS (PREVENTS CRASHES) ---
 # def clean_float(value):
 #     """
-#     Checks if a float is valid for JSON. 
-#     If it is NaN or Infinity, returns None (null in JSON).
+#     Checks if a float is valid for JSON (handles NaN/Inf/Numpy types).
+#     Returns None if invalid, which JSON accepts as 'null'.
 #     """
 #     if value is None:
 #         return None
 #     try:
-#         val = float(value)
+#         val = float(value) # Force conversion from np.float to python float
 #         if math.isnan(val) or math.isinf(val):
 #             return None
 #         return val
@@ -354,7 +520,7 @@ if __name__ == "__main__":
 # def clean_nan_values(obj):
 #     """
 #     Recursively cleans a complex object (dict/list) to replace NaNs with None.
-#     Critical for the /hero-graphs endpoint.
+#     Crucial for nested responses like hero-graphs or gene-intelligence.
 #     """
 #     if isinstance(obj, float):
 #         return clean_float(obj)
@@ -376,6 +542,10 @@ if __name__ == "__main__":
 
 # @app.get("/metadata")
 # async def get_metadata():
+#     """
+#     Returns patient list and gene list. 
+#     Includes 'genes' in patient object so Auto-Fill works in frontend.
+#     """
 #     try:
 #         df_tcga = art["df_tcga"]
 #         test_ids = art["df_test"].index.tolist()[:100] 
@@ -383,10 +553,14 @@ if __name__ == "__main__":
 #         patients = []
 #         for pid in test_ids:
 #             if pid in df_tcga.index:
+#                 # Extract actual gene values for this patient to enable auto-fill
+#                 patient_genes = df_tcga.loc[pid, gene_features].to_dict()
+                
 #                 patients.append({
 #                     "id": pid,
-#                     "age": float(df_tcga.loc[pid, "AGE"]),
-#                     "node": 1 if df_tcga.loc[pid, "NODE_POS"] == 1 else 0
+#                     "age": clean_float(df_tcga.loc[pid, "AGE"]),
+#                     "node": 1 if df_tcga.loc[pid, "NODE_POS"] == 1 else 0,
+#                     "genes": clean_nan_values(patient_genes) 
 #                 })
         
 #         return {"genes": gene_features, "patients": patients}
@@ -396,145 +570,413 @@ if __name__ == "__main__":
 
 # @app.post("/predict")
 # async def predict(data: InferenceRequest):
-#     print("\n--- NEW PREDICTION REQUEST ---")
-#     print(f"Input: Age={data.age}, Node={data.nodeStatus}")
-    
+#     """
+#     The Core Inference Logic. 
+#     1. Feature Engineering (Age + Node + Genes)
+#     2. Scaling (StandardScaler)
+#     3. Model Prediction (Cox + RSF)
+#     4. Grid Synchronization (200 points)
+#     5. Metric Calculation (Median, RMST, Agreement)
+#     6. Response Formatting (Strict TypeSync)
+#     """
 #     try:
-#         # 1. Feature Preparation
+#         # --- 1. FEATURE PREPARATION ---
 #         node_pos = 1 if data.nodeStatus == "Positive" else 0
 #         row_dict = {"AGE": data.age, "NODE_POS": node_pos}
 #         row_dict.update(data.genes)
         
-#         row_raw = pd.DataFrame([row_dict])
-#         #  row_raw = pd.DataFrame([row_dict])[features]
-#         for feature in features:
-#             if feature not in row_raw.columns:
-#                 row_raw[feature] = 0.0
-#         # the actual logic is
-#         #         row_raw = pd.DataFrame([row_dict])[features]
-#         # X_row = scaler.transform(row_raw.values)
-#         # df_row_scaled = pd.DataFrame(X_row, columns=features)
-
+#         # Create DataFrame ensuring EXACT column order required by Scaler
+#         row_raw = pd.DataFrame([row_dict], columns=features)
+        
+#         # Safeguard: Fill missing columns with 0.0 to prevent crash
+#         row_raw = row_raw.fillna(0.0)
+        
 #         # Scale
-#         row_raw = row_raw[features]
 #         X_row = scaler.transform(row_raw.values)
 #         df_row_scaled = pd.DataFrame(X_row, columns=features)
 
-#         # 2. Cox Inference
-#         # it is Cox Hazard
-#         print("Running Cox Inference...")
+#         # --- 2. MODEL INFERENCE ---
+        
+#         # Cox Hazard
 #         hazard_cox = float(cph.predict_partial_hazard(df_row_scaled).values[0])
-#         surv_funcs_cox = cph.predict_survival_function(df_row_scaled)
-#         times_cox = surv_funcs_cox.index.values
-#         # times_cox = surv_func_cox.index.values.astype(float)
-#         surv_cox = surv_funcs_cox.values.flatten()
-#         # why has the values been faltted?
-#         #    surv_cox = surv_func_cox.values[:, 0].astype(float)
-#         median_cox = median_survival_time(times_cox, surv_cox)
-#         # median cox us not under cox indrence
+#         surv_func_cox = cph.predict_survival_function(df_row_scaled)
+#         # Extract times and probabilities (Step function)
+#         times_cox = surv_func_cox.index.values.astype(float)
+#         surv_cox = surv_func_cox.values[:, 0].astype(float)
 
-#         # 3. RSF Inference
-#         print("Running RSF Inference...")
-#         surv_funcs_rsf = rsf.predict_survival_function(X_row, return_array=True)
-#         surv_rsf = surv_funcs_rsf[0]
-#         times_rsf = rsf.unique_times_
-#         median_rsf = median_survival_time(times_rsf, surv_rsf)
-#         # mediam rsf not in logic nstead
-#                # RSF Risk
-#         # surv_funcs_rsf = rsf.predict_survival_function(X_row)
-#         # sf_rsf = surv_funcs_rsf[0]
-#         # times_rsf = sf_rsf.x.astype(float)
-#         # surv_rsf = sf_rsf.y.astype(float)
+#         # RSF Risk
+#         surv_funcs_rsf = rsf.predict_survival_function(X_row)
+#         sf_rsf = surv_funcs_rsf[0]
+#         # Extract times and probabilities (Step function)
+#         times_rsf = sf_rsf.x.astype(float)
+#         surv_rsf = sf_rsf.y.astype(float)
 
-#         # 4. Metrics
-#         consensus_median = np.nanmean([median_cox, median_rsf])
-#         agree = agreement_score(median_cox, median_rsf)
+#         # --- 3. GRID SYNCHRONIZATION (The "Original Logic") ---
+#         # We must interpolate both models onto a shared time grid to calculate 
+#         # consensus and draw the graph correctly.
+#         t_min = 0.0
+#         t_max = min(times_cox.max(), times_rsf.max())
         
-#         risk_mb_cox = cph.predict_partial_hazard(art["df_mb_s"]).values.flatten()
-#         percentile = (risk_mb_cox < hazard_cox).mean() * 100
+#         # Create a common grid of 200 points
+#         grid = np.linspace(t_min, t_max, 200) 
 
-#         # 5. Graphs
-#         indices = np.linspace(0, len(times_cox) - 1, 50, dtype=int)
-#         rsf_interp = np.interp(times_cox[indices], times_rsf, surv_rsf)
+#         # Interpolate
+#         surv_cox_grid = np.interp(grid, times_cox, surv_cox)
+#         surv_rsf_grid = np.interp(grid, times_rsf, surv_rsf)
+
+#         # --- 4. METRIC EXTRACTION ---
+#         m_cox = median_survival_time(grid, surv_cox_grid)
+#         m_rsf = median_survival_time(grid, surv_rsf_grid)
         
-#         print("\n--- DEBUGGING CALCULATED VALUES ---")
-
-#         print(f"Cox Median (Raw): {median_cox}")
-
-#         print(f"RSF Median (Raw): {median_rsf}")
-
-#         print(f"Consensus (Raw): {consensus_median}")
-
-#         print(f"Agreement (Raw): {agree}")
-
-#         print(f"Percentile (Raw): {percentile}")
-
+#         r_cox = rmst(grid, surv_cox_grid)
+#         r_rsf = rmst(grid, surv_rsf_grid)
         
+#         # Consensus & Agreement
+#         consensus_median = np.nanmean([m_cox, m_rsf])
+#         agree = agreement_score(m_cox, m_rsf)
 
-#         # Check for NaNs in arrays
+#         # Logging for Debugging
+#         print(f"Inference -> Age: {data.age}, Node: {data.nodeStatus}")
+#         print(f"Cox Median: {m_cox}, RSF Median: {m_rsf}, Agreement: {agree}")
 
-#         if np.isnan(surv_cox[indices]).any():
-
-#             print("WARNING: NaN found in Cox Graph Data")
-
-#         if np.isnan(rsf_interp).any():
-
-#             print("WARNING: NaN found in RSF Graph Data")
-#         # --- SAFE RETURN WITH CLEANING ---
+#         # --- 5. RESPONSE CONSTRUCTION (STRICT TYPESYNC) ---
+#         # We manually build the dict using `clean_float` and `float()` casting 
+#         # to ensure no Numpy types leak into the JSON response.
+        
 #         response = {
-#             "cox_median": clean_float(median_cox),
-#             "rsf_median": clean_float(median_rsf),
-#             "consensus_median": clean_float(consensus_median),
-#             "agreement_score": clean_float(agree),
-#             "agreement_label": agreement_label(agree),
-#             "risk_percentile": clean_float(percentile),
-#             "graph_data": {
-#                 "times": [clean_float(t) for t in times_cox[indices]],
-#                 "cox": [clean_float(c) for c in surv_cox[indices]],
-#                 "rsf": [clean_float(r) for r in rsf_interp]
-#             }
+#             "summary": {
+#                 "coxHazard": clean_float(hazard_cox),
+#                    "rsfRisk": round(float(sf_rsf.y[-1]), 2),
+#                 # "rsfRisk": clean_float(1.0 - float(surv_rsf_grid[-1])), # Risk = 1 - Survival
+#                 "agreement": clean_float(agree),
+#                 "agreementLabel": agreement_label(agree)
+#             },
+#             "estimates": {
+#                 # "medianCox": clean_float(m_cox),
+#                 # "medianRsf": clean_float(m_rsf),
+#                 # "consensus": clean_float(consensus_median)
+#                 "medianCox": clean_float(m_cox, 1),
+#                 "medianRsf": clean_float(m_rsf, 1),
+#                 "consensus": clean_float(consensus_median, 1)
+#             },
+#             "rmst": {
+#                 # "cox": clean_float(r_cox),
+#                 # "rsf": clean_float(r_rsf)
+#                 "cox": clean_float(r_cox, 1),
+#                 "rsf": clean_float(r_rsf, 1)
+#             },
+#             # Graph Data formatted specifically for Recharts
+#             "curveData": [
+#                 {
+#                     "time": float(t), 
+#                     "cox": float(c), 
+#                     "rsf": float(r)
+#                 } 
+#                 for t, c, r in zip(grid, surv_cox_grid, surv_rsf_grid)
+#             ]
 #         }
         
-#         print("Response prepared successfully.")
 #         return response
 
 #     except Exception as e:
-#         print(f"PREDICTION CRASHED: {e}")
+#         print(f"PREDICTION ERROR: {str(e)}")
 #         traceback.print_exc()
-#         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+#         raise HTTPException(status_code=500, detail=str(e))
 
-
-# # ====ACTUAL LOGIC BEFORE DEPLOYMENT
-
-# # =================================================================
-# # NEW ENDPOINT: GENE INTELLIGENCE
-# # =================================================================
 # @app.get("/gene-intelligence")
 # async def get_gene_data():
 #     try:
-#         # Check if art exists
 #         if art is None:
 #              raise HTTPException(status_code=500, detail="Model artifacts not loaded")
         
 #         data = get_gene_intelligence(art)
-#         # CRITICAL FIX: Clean NaNs before sending JSON
+#         # SAFEGUARD: Recursively clean NaNs
 #         return clean_nan_values(data)
 #     except Exception as e:
 #         print(f"GENE INTELLIGENCE ERROR: {e}")
 #         traceback.print_exc()
 #         raise HTTPException(status_code=500, detail=str(e))
 
-# # =================================================================
-# # FIXED ENDPOINT: HERO GRAPHS (Added clean_nan_values)
-# # =================================================================
 # @app.get("/hero-graphs")
 # async def get_landing_graphs():
 #     try:
-#         from graph import get_hero_graphs
 #         data = get_hero_graphs(art)
-#         # CRITICAL FIX: Clean NaNs to prevent 500 Internal Server Error
+#         # SAFEGUARD: Recursively clean NaNs
 #         return clean_nan_values(data)
 #     except Exception as e:
 #         print(f"HERO GRAPH ERROR: {e}")
 #         traceback.print_exc()
 #         raise HTTPException(status_code=500, detail=str(e))
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     # Local development runner
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
+# # import os
+# # import math
+# # import numpy as np
+# # import pandas as pd
+# # from fastapi import FastAPI, HTTPException
+# # from fastapi.middleware.cors import CORSMiddleware
+# # from pydantic import BaseModel
+# # from typing import Dict, List, Optional
+# # import traceback
+# # from graph import get_hero_graphs
+# # from gene import get_gene_intelligence
+
+# # # Import pure logic
+# # #import from app-> get_arti, median_surviva_rmst,agre_score,agr_label 
+# # from model_logic import (
+# #     get_artifacts,
+# #     median_survival_time,
+# #     rmst,
+# #     agreement_score,
+# #     agreement_label
+# # )
+# # # from graph import get_hero_graphs
+# # # from gene import get_gene_intelligence
+
+# # app = FastAPI(title="OncoRisk Dual-Model API")
+
+# # # --- CORS SECURITY ---
+# # frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/')
+# # # --------------------extra
+# # origins = [
+# #     frontend_url,
+# #     "https://onco-survival-ml-front-end.vercel.app",
+# #     "http://localhost:5173",
+# #     "http://localhost:3000",
+# # ]
+# # # --------extra^
+# # app.add_middleware(
+# #     CORSMiddleware,
+# #     allow_origins=["*"], # Keep wildcard for debugging, restrict in production if needed
+# #     allow_credentials=True,
+# #     allow_methods=["*"],
+# #     allow_headers=["*"],
+# # )
+
+# # # --- INITIALIZATION ---
+# # print("Initializing Model Artifacts...")
+# # try:
+# #     art = get_artifacts()
+# #     scaler = art["scaler"]
+# #     cph = art["cph"]
+# #     print(cph);
+# #     rsf = art["rsf"]
+# #     features = art["features"]
+# #     gene_features = art["gene_features"]
+# #     print("Artifacts Loaded Successfully.")
+# # except Exception as e:
+# #     print(f"CRITICAL ERROR LOADING ARTIFACTS: {e}")
+# #     traceback.print_exc()
+
+# # # --- DATA MODELS ---
+# # class InferenceRequest(BaseModel):
+# #     age: float
+# #     nodeStatus: str 
+# #     genes: Dict[str, float]
+
+# # # --- HELPER: THE FIX FOR JSON ERRORS ---
+# # def clean_float(value):
+# #     """
+# #     Checks if a float is valid for JSON. 
+# #     If it is NaN or Infinity, returns None (null in JSON).
+# #     """
+# #     if value is None:
+# #         return None
+# #     try:
+# #         val = float(value)
+# #         if math.isnan(val) or math.isinf(val):
+# #             return None
+# #         return val
+# #     except Exception:
+# #         return None
+
+# # def clean_nan_values(obj):
+# #     """
+# #     Recursively cleans a complex object (dict/list) to replace NaNs with None.
+# #     Critical for the /hero-graphs endpoint.
+# #     """
+# #     if isinstance(obj, float):
+# #         return clean_float(obj)
+# #     elif isinstance(obj, dict):
+# #         return {k: clean_nan_values(v) for k, v in obj.items()}
+# #     elif isinstance(obj, list):
+# #         return [clean_nan_values(v) for v in obj]
+# #     elif isinstance(obj, (np.float64, np.float32)):
+# #         return clean_float(obj)
+# #     elif isinstance(obj, (np.int64, np.int32)):
+# #         return int(obj)
+# #     return obj
+
+# # # --- ENDPOINTS ---
+
+# # @app.get("/")
+# # def health_check():
+# #     return {"status": "running", "allowed_origin": frontend_url}
+
+# # @app.get("/metadata")
+# # async def get_metadata():
+# #     try:
+# #         df_tcga = art["df_tcga"]
+# #         test_ids = art["df_test"].index.tolist()[:100] 
+        
+# #         patients = []
+# #         for pid in test_ids:
+# #             if pid in df_tcga.index:
+# #                 patients.append({
+# #                     "id": pid,
+# #                     "age": float(df_tcga.loc[pid, "AGE"]),
+# #                     "node": 1 if df_tcga.loc[pid, "NODE_POS"] == 1 else 0
+# #                 })
+        
+# #         return {"genes": gene_features, "patients": patients}
+# #     except Exception as e:
+# #         print(f"METADATA ERROR: {e}")
+# #         raise HTTPException(status_code=500, detail=str(e))
+
+# # @app.post("/predict")
+# # async def predict(data: InferenceRequest):
+# #     print("\n--- NEW PREDICTION REQUEST ---")
+# #     print(f"Input: Age={data.age}, Node={data.nodeStatus}")
+    
+# #     try:
+# #         # 1. Feature Preparation
+# #         node_pos = 1 if data.nodeStatus == "Positive" else 0
+# #         row_dict = {"AGE": data.age, "NODE_POS": node_pos}
+# #         row_dict.update(data.genes)
+        
+# #         row_raw = pd.DataFrame([row_dict])
+# #         #  row_raw = pd.DataFrame([row_dict])[features]
+# #         for feature in features:
+# #             if feature not in row_raw.columns:
+# #                 row_raw[feature] = 0.0
+# #         # the actual logic is
+# #         #         row_raw = pd.DataFrame([row_dict])[features]
+# #         # X_row = scaler.transform(row_raw.values)
+# #         # df_row_scaled = pd.DataFrame(X_row, columns=features)
+
+# #         # Scale
+# #         row_raw = row_raw[features]
+# #         X_row = scaler.transform(row_raw.values)
+# #         df_row_scaled = pd.DataFrame(X_row, columns=features)
+
+# #         # 2. Cox Inference
+# #         # it is Cox Hazard
+# #         print("Running Cox Inference...")
+# #         hazard_cox = float(cph.predict_partial_hazard(df_row_scaled).values[0])
+# #         surv_funcs_cox = cph.predict_survival_function(df_row_scaled)
+# #         times_cox = surv_funcs_cox.index.values
+# #         # times_cox = surv_func_cox.index.values.astype(float)
+# #         surv_cox = surv_funcs_cox.values.flatten()
+# #         # why has the values been faltted?
+# #         #    surv_cox = surv_func_cox.values[:, 0].astype(float)
+# #         median_cox = median_survival_time(times_cox, surv_cox)
+# #         # median cox us not under cox indrence
+
+# #         # 3. RSF Inference
+# #         print("Running RSF Inference...")
+# #         surv_funcs_rsf = rsf.predict_survival_function(X_row, return_array=True)
+# #         surv_rsf = surv_funcs_rsf[0]
+# #         times_rsf = rsf.unique_times_
+# #         median_rsf = median_survival_time(times_rsf, surv_rsf)
+# #         # mediam rsf not in logic nstead
+# #                # RSF Risk
+# #         # surv_funcs_rsf = rsf.predict_survival_function(X_row)
+# #         # sf_rsf = surv_funcs_rsf[0]
+# #         # times_rsf = sf_rsf.x.astype(float)
+# #         # surv_rsf = sf_rsf.y.astype(float)
+
+# #         # 4. Metrics
+# #         consensus_median = np.nanmean([median_cox, median_rsf])
+# #         agree = agreement_score(median_cox, median_rsf)
+        
+# #         risk_mb_cox = cph.predict_partial_hazard(art["df_mb_s"]).values.flatten()
+# #         percentile = (risk_mb_cox < hazard_cox).mean() * 100
+
+# #         # 5. Graphs
+# #         indices = np.linspace(0, len(times_cox) - 1, 50, dtype=int)
+# #         rsf_interp = np.interp(times_cox[indices], times_rsf, surv_rsf)
+        
+# #         print("\n--- DEBUGGING CALCULATED VALUES ---")
+
+# #         print(f"Cox Median (Raw): {median_cox}")
+
+# #         print(f"RSF Median (Raw): {median_rsf}")
+
+# #         print(f"Consensus (Raw): {consensus_median}")
+
+# #         print(f"Agreement (Raw): {agree}")
+
+# #         print(f"Percentile (Raw): {percentile}")
+
+        
+
+# #         # Check for NaNs in arrays
+
+# #         if np.isnan(surv_cox[indices]).any():
+
+# #             print("WARNING: NaN found in Cox Graph Data")
+
+# #         if np.isnan(rsf_interp).any():
+
+# #             print("WARNING: NaN found in RSF Graph Data")
+# #         # --- SAFE RETURN WITH CLEANING ---
+# #         response = {
+# #             "cox_median": clean_float(median_cox),
+# #             "rsf_median": clean_float(median_rsf),
+# #             "consensus_median": clean_float(consensus_median),
+# #             "agreement_score": clean_float(agree),
+# #             "agreement_label": agreement_label(agree),
+# #             "risk_percentile": clean_float(percentile),
+# #             "graph_data": {
+# #                 "times": [clean_float(t) for t in times_cox[indices]],
+# #                 "cox": [clean_float(c) for c in surv_cox[indices]],
+# #                 "rsf": [clean_float(r) for r in rsf_interp]
+# #             }
+# #         }
+        
+# #         print("Response prepared successfully.")
+# #         return response
+
+# #     except Exception as e:
+# #         print(f"PREDICTION CRASHED: {e}")
+# #         traceback.print_exc()
+# #         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+
+
+# # # ====ACTUAL LOGIC BEFORE DEPLOYMENT
+
+# # # =================================================================
+# # # NEW ENDPOINT: GENE INTELLIGENCE
+# # # =================================================================
+# # @app.get("/gene-intelligence")
+# # async def get_gene_data():
+# #     try:
+# #         # Check if art exists
+# #         if art is None:
+# #              raise HTTPException(status_code=500, detail="Model artifacts not loaded")
+        
+# #         data = get_gene_intelligence(art)
+# #         # CRITICAL FIX: Clean NaNs before sending JSON
+# #         return clean_nan_values(data)
+# #     except Exception as e:
+# #         print(f"GENE INTELLIGENCE ERROR: {e}")
+# #         traceback.print_exc()
+# #         raise HTTPException(status_code=500, detail=str(e))
+
+# # # =================================================================
+# # # FIXED ENDPOINT: HERO GRAPHS (Added clean_nan_values)
+# # # =================================================================
+# # @app.get("/hero-graphs")
+# # async def get_landing_graphs():
+# #     try:
+# #         from graph import get_hero_graphs
+# #         data = get_hero_graphs(art)
+# #         # CRITICAL FIX: Clean NaNs to prevent 500 Internal Server Error
+# #         return clean_nan_values(data)
+# #     except Exception as e:
+# #         print(f"HERO GRAPH ERROR: {e}")
+# #         traceback.print_exc()
+# #         raise HTTPException(status_code=500, detail=str(e))
