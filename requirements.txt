@@ -4,9 +4,8 @@ pandas==2.2.2
 scikit-learn==1.5.2
 lifelines==0.29.0
 scikit-survival==0.23.1
-joblib
-matplotlib
-fastapi
-uvicorn
-gunicorn
-python-3.12.8
+joblib==1.4.2
+matplotlib==3.9.2
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+gunicorn==23.0.0
